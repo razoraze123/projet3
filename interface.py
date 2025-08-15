@@ -1,9 +1,13 @@
 import os
+import sys
+import json
+from pathlib import Path
+from datetime import datetime
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false;qt.qpa.*=false")
 
 from typing import Callable
 
-from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, Signal
+from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, Signal, QProcess, Slot
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
@@ -29,6 +33,55 @@ from PySide6.QtWidgets import (
 )
 
 GLOBAL_CONSOLE: QTextEdit | None = None
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+SETTINGS_FILE = PROJECT_ROOT / "settings.json"
+
+def load_settings() -> dict:
+    try:
+        return json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+
+def save_settings(d: dict) -> None:
+    try:
+        SETTINGS_FILE.write_text(json.dumps(d, indent=2, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:
+        print_safe(f"[settings] Erreur sauvegarde: {e}")
+
+def ts() -> str:
+    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+ALLOWED_SUFFIXES = {".py", ".qss", ".ui", ".json", ".md", ".txt", ".yaml", ".yml"}
+EXCLUDE_DIRS = {".git", "__pycache__", "venv", "env", ".idea", ".vscode", "build", "dist", ".mypy_cache", ".pytest_cache"}
+
+def generate_code_txt(output_path: Path) -> int:
+    count = 0
+    print_safe(f"[{ts()}] Génération de {output_path.name}…")
+    with output_path.open("w", encoding="utf-8", errors="replace") as out:
+        out.write(f"# Code snapshot — {ts()} — root: {PROJECT_ROOT}\n")
+        for p in sorted(PROJECT_ROOT.rglob("*")):
+            try:
+                if any(part in EXCLUDE_DIRS for part in p.parts):
+                    continue
+                if not p.is_file() or p.name == output_path.name:
+                    continue
+                if p.suffix.lower() not in ALLOWED_SUFFIXES:
+                    continue
+                text = p.read_text(encoding="utf-8", errors="replace")
+            except Exception as e:
+                print_safe(f"[Code.txt] Skip {p}: {e}")
+                continue
+            rel = p.relative_to(PROJECT_ROOT)
+            out.write(f"\n\n# ===== FILE: {rel} =====\n")
+            out.write(f"# SIZE: {p.stat().st_size} bytes\n# BEGIN\n")
+            out.write(text)
+            if not text.endswith("\n"):
+                out.write("\n")
+            out.write(f"# END FILE: {rel}\n")
+            count += 1
+    print_safe(f"[{ts()}] {output_path.name} OK — {count} fichiers.")
+    return count
 
 
 def print_safe(msg: str) -> None:
@@ -58,20 +111,28 @@ def get_icon(name: str) -> QIcon:
 class ThemeManager:
     def __init__(self, app: QApplication) -> None:
         self.app = app
+        self.current = "dark"
 
     def apply(self, theme: str) -> None:
+        self.current = theme
         if theme == "light":
-            self.app.setStyleSheet(""
-                "QWidget{background:#fff;color:#000;}"
-                "QPushButton{background:#f0f0f0;}"
-                "QPushButton:hover{background:#e0e0e0;}"
-            "")
+            self.app.setStyleSheet(
+                "QWidget{background:#ffffff;color:#111;}"
+                "QPushButton{background:#f2f2f2;color:#111;border:1px solid #ddd;}"
+                "QPushButton:hover{background:#e9e9e9;}"
+                "QLineEdit,QTextEdit,QComboBox,QListWidget{background:#fff;color:#111;border:1px solid #ccc;}"
+                "QTabBar::tab{background:#f6f6f6;padding:6px;border:1px solid #ddd;}"
+                "QTabBar::tab:selected{background:#eaeaea;}"
+            )
         else:
-            self.app.setStyleSheet(""
-                "QWidget{background:#2b2b2b;color:#ddd;}"
-                "QPushButton{background:#444;color:#fff;}"
+            self.app.setStyleSheet(
+                "QWidget{background:#222;color:#ddd;}"
+                "QPushButton{background:#444;color:#fff;border:1px solid #333;}"
                 "QPushButton:hover{background:#555;}"
-            "")
+                "QLineEdit,QTextEdit,QComboBox,QListWidget{background:#2b2b2b;color:#eee;border:1px solid #3a3a3a;}"
+                "QTabBar::tab{background:#333;padding:6px;border:1px solid #3a3a3a;}"
+                "QTabBar::tab:selected{background:#3b3b3b;}"
+            )
 
 
 class AnimatedStack(QStackedWidget):
@@ -195,7 +256,7 @@ class ProfileWidget(QWidget):
         layout.addWidget(refresh)
         layout.addStretch()
         choose.clicked.connect(lambda: self.profile_chosen.emit("bob crew"))
-        refresh.clicked.connect(self.profiles_updated)
+        refresh.clicked.connect(self.profiles_updated.emit)
 
 
 class GalleryWidget(SimpleLabelPage):
@@ -300,31 +361,110 @@ class ScrapWidget(QWidget):
 
 
 class SettingsPage(QWidget):
-    def __init__(self) -> None:
+    def __init__(self, theme_manager: ThemeManager) -> None:
         super().__init__()
+        self.theme_manager = theme_manager
+
         layout = QVBoxLayout(self)
-        buttons_layout = QHBoxLayout()
+
+        # Ligne de contrôle (switch + boutons)
+        top = QHBoxLayout()
+        self.theme_switch = QCheckBox("Mode sombre")
         update_btn = QPushButton("Mettre à jour l'app")
         restart_btn = QPushButton("Redémarrer")
         txt_btn = QPushButton("Mettre à jour le txt")
-        buttons_layout.addWidget(update_btn)
-        buttons_layout.addWidget(restart_btn)
-        buttons_layout.addWidget(txt_btn)
-        layout.addLayout(buttons_layout)
+        top.addWidget(self.theme_switch)
+        top.addStretch()
+        top.addWidget(update_btn)
+        top.addWidget(restart_btn)
+        top.addWidget(txt_btn)
+        layout.addLayout(top)
+
+        # Console
         self.console = QTextEdit(readOnly=True)
         layout.addWidget(self.console)
         global GLOBAL_CONSOLE
         GLOBAL_CONSOLE = self.console
-        update_btn.clicked.connect(lambda: print_safe("Mise à jour simulée… OK"))
-        restart_btn.clicked.connect(lambda: print_safe("Redémarrage simulé… OK"))
-        txt_btn.clicked.connect(lambda: print_safe("Régénération du txt simulée… OK"))
+
+        # Init thème depuis settings
+        s = load_settings()
+        current = s.get("theme", self.theme_manager.current)
+        self.theme_switch.setChecked(current == "dark")
+        self.apply_theme_from_switch(init=True)
+
+        # Connexions
+        self.theme_switch.toggled.connect(lambda _: self.apply_theme_from_switch())
+        update_btn.clicked.connect(self.run_git_pull)
+        restart_btn.clicked.connect(self.restart_app)
+        txt_btn.clicked.connect(self.update_code_txt)
+
+        # QProcess pour git
+        self.git_proc = QProcess(self)
+        self.git_proc.setWorkingDirectory(str(PROJECT_ROOT))
+        self.git_proc.readyReadStandardOutput.connect(self._pipe_stdout)
+        self.git_proc.readyReadStandardError.connect(self._pipe_stderr)
+        self.git_proc.finished.connect(self._git_finished)
+
+    # --- Thème ---
+    def apply_theme_from_switch(self, init: bool = False) -> None:
+        theme = "dark" if self.theme_switch.isChecked() else "light"
+        self.theme_manager.apply(theme)
+        s = load_settings()
+        s["theme"] = theme
+        save_settings(s)
+        if not init:
+            print_safe(f"[{ts()}] Thème appliqué: {theme}")
+
+    # --- Git pull ---
+    def run_git_pull(self) -> None:
+        if self.git_proc.state() != QProcess.NotRunning:
+            print_safe(f"[{ts()}] git déjà en cours…")
+            return
+        print_safe(f"[{ts()}] git pull origin main …")
+        self.git_proc.setProgram("git")
+        self.git_proc.setArguments(["pull", "origin", "main"])
+        self.git_proc.start()
+
+    @Slot()
+    def _pipe_stdout(self) -> None:
+        data = self.git_proc.readAllStandardOutput().data().decode(errors="replace")
+        if data:
+            for line in data.splitlines():
+                print_safe(line)
+
+    @Slot()
+    def _pipe_stderr(self) -> None:
+        data = self.git_proc.readAllStandardError().data().decode(errors="replace")
+        if data:
+            for line in data.splitlines():
+                print_safe("[git] " + line)
+
+    @Slot(int, QProcess.ExitStatus)
+    def _git_finished(self, code: int, status) -> None:
+        print_safe(f"[{ts()}] git terminé avec code={code}")
+
+    # --- Redémarrer ---
+    def restart_app(self) -> None:
+        print_safe(f"[{ts()}] Redémarrage demandé…")
+        QProcess.startDetached(sys.executable, sys.argv)
+        QApplication.instance().quit()
+
+    # --- Générer Code.txt ---
+    def update_code_txt(self) -> None:
+        out = PROJECT_ROOT / "Code.txt"
+        try:
+            n = generate_code_txt(out)
+            print_safe(f"[{ts()}] Fini: {n} fichiers dans {out}")
+        except Exception as e:
+            print_safe(f"[{ts()}] Erreur génération Code.txt: {e}")
 
 
 class MainWindow(QMainWindow):
     def __init__(self, theme: ThemeManager) -> None:
         super().__init__()
         self.theme = theme
-        self.theme.apply("light")
+        s = load_settings()
+        self.theme.apply(s.get("theme", "dark"))
         self.setWindowTitle("COMPTA - Interface de gestion comptable")
         self.setMinimumSize(1200, 700)
 
@@ -413,7 +553,7 @@ class MainWindow(QMainWindow):
         self.accounts_page = AccountWidget()
         self.revision_page = RevisionTab()
         self.compta_params_page = SimpleLabelPage("Paramètres compta (stub)")
-        self.settings_page = SettingsPage()
+        self.settings_page = SettingsPage(self.theme)
 
         for w in [
             self.profile_page,

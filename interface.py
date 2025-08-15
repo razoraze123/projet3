@@ -1,6 +1,7 @@
 import os
 import sys
 import json
+import re
 from pathlib import Path
 from datetime import datetime
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false;qt.qpa.*=false")
@@ -8,7 +9,7 @@ os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false;qt.qpa.*=false")
 from typing import Callable
 
 from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, Signal, QProcess, Slot
-from PySide6.QtGui import QIcon, QKeySequence, QShortcut
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QColor, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -30,12 +31,15 @@ from PySide6.QtWidgets import (
     QWidget,
     QFileDialog,
     QStyle,
+    QGraphicsDropShadowEffect,
+    QPlainTextEdit,
 )
 
 GLOBAL_CONSOLE: QTextEdit | None = None
 
 PROJECT_ROOT = Path(__file__).resolve().parent
 SETTINGS_FILE = PROJECT_ROOT / "settings.json"
+STYLE_FILE = PROJECT_ROOT / "style.qss"
 
 def load_settings() -> dict:
     try:
@@ -88,6 +92,25 @@ def print_safe(msg: str) -> None:
     print(msg)
     if GLOBAL_CONSOLE is not None:
         GLOBAL_CONSOLE.append(msg)
+
+
+def apply_qss(qss: str, include_sidebar: bool, has_shadow: bool) -> None:
+    app = QApplication.instance()
+    base = app.styleSheet()
+    app.setStyleSheet(base + "\n" + qss)
+    for w in QApplication.allWidgets():
+        if isinstance(w, QPushButton):
+            if not include_sidebar and w.objectName() == "sidebar-item":
+                w.setGraphicsEffect(None)
+                continue
+            if has_shadow:
+                eff = QGraphicsDropShadowEffect()
+                eff.setBlurRadius(12)
+                eff.setOffset(0, 2)
+                eff.setColor(QColor("#00000080"))
+                w.setGraphicsEffect(eff)
+            else:
+                w.setGraphicsEffect(None)
 
 
 def get_icon(name: str) -> QIcon:
@@ -360,14 +383,13 @@ class ScrapWidget(QWidget):
             self.tabs.addTab(SimpleLabelPage(name), name)
 
 
-class SettingsPage(QWidget):
+class MaintenanceTab(QWidget):
     def __init__(self, theme_manager: ThemeManager) -> None:
         super().__init__()
         self.theme_manager = theme_manager
 
         layout = QVBoxLayout(self)
 
-        # Ligne de contrôle (switch + boutons)
         top = QHBoxLayout()
         self.theme_switch = QCheckBox("Mode sombre")
         update_btn = QPushButton("Mettre à jour l'app")
@@ -380,32 +402,27 @@ class SettingsPage(QWidget):
         top.addWidget(txt_btn)
         layout.addLayout(top)
 
-        # Console
         self.console = QTextEdit(readOnly=True)
         layout.addWidget(self.console)
         global GLOBAL_CONSOLE
         GLOBAL_CONSOLE = self.console
 
-        # Init thème depuis settings
         s = load_settings()
         current = s.get("theme", self.theme_manager.current)
         self.theme_switch.setChecked(current == "dark")
         self.apply_theme_from_switch(init=True)
 
-        # Connexions
         self.theme_switch.toggled.connect(lambda _: self.apply_theme_from_switch())
         update_btn.clicked.connect(self.run_git_pull)
         restart_btn.clicked.connect(self.restart_app)
         txt_btn.clicked.connect(self.update_code_txt)
 
-        # QProcess pour git
         self.git_proc = QProcess(self)
         self.git_proc.setWorkingDirectory(str(PROJECT_ROOT))
         self.git_proc.readyReadStandardOutput.connect(self._pipe_stdout)
         self.git_proc.readyReadStandardError.connect(self._pipe_stderr)
         self.git_proc.finished.connect(self._git_finished)
 
-    # --- Thème ---
     def apply_theme_from_switch(self, init: bool = False) -> None:
         theme = "dark" if self.theme_switch.isChecked() else "light"
         self.theme_manager.apply(theme)
@@ -415,7 +432,6 @@ class SettingsPage(QWidget):
         if not init:
             print_safe(f"[{ts()}] Thème appliqué: {theme}")
 
-    # --- Git pull ---
     def run_git_pull(self) -> None:
         if self.git_proc.state() != QProcess.NotRunning:
             print_safe(f"[{ts()}] git déjà en cours…")
@@ -443,13 +459,11 @@ class SettingsPage(QWidget):
     def _git_finished(self, code: int, status) -> None:
         print_safe(f"[{ts()}] git terminé avec code={code}")
 
-    # --- Redémarrer ---
     def restart_app(self) -> None:
         print_safe(f"[{ts()}] Redémarrage demandé…")
         QProcess.startDetached(sys.executable, sys.argv)
         QApplication.instance().quit()
 
-    # --- Générer Code.txt ---
     def update_code_txt(self) -> None:
         out = PROJECT_ROOT / "Code.txt"
         try:
@@ -459,12 +473,235 @@ class SettingsPage(QWidget):
             print_safe(f"[{ts()}] Erreur génération Code.txt: {e}")
 
 
+class StyleTab(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        main = QHBoxLayout(self)
+
+        self.editors = QTabWidget()
+        self.html_edit = QPlainTextEdit()
+        self.css_edit = QPlainTextEdit()
+        self.js_edit = QPlainTextEdit()
+        mono = QFont("monospace")
+        self.html_edit.setFont(mono)
+        self.css_edit.setFont(mono)
+        self.js_edit.setFont(mono)
+        self.editors.addTab(self.html_edit, "HTML")
+        self.editors.addTab(self.css_edit, "CSS")
+        self.editors.addTab(self.js_edit, "JS")
+        main.addWidget(self.editors, 3)
+
+        right = QVBoxLayout()
+        self.preview_buttons: list[QPushButton] = []
+        for text, var in [
+            ("Primary", "primary"),
+            ("Secondary", "secondary"),
+            ("Danger", "danger"),
+            ("Ghost", "ghost"),
+        ]:
+            b = QPushButton(text)
+            b.setProperty("variant", var)
+            self.preview_buttons.append(b)
+            right.addWidget(b)
+
+        self.apply_cb = QCheckBox("Appliquer à toute l'app")
+        self.apply_cb.setChecked(True)
+        self.sidebar_cb = QCheckBox("Inclure la sidebar")
+        right.addWidget(self.apply_cb)
+        right.addWidget(self.sidebar_cb)
+
+        btns = QHBoxLayout()
+        preview_btn = QPushButton("Aperçu Qt")
+        apply_btn = QPushButton("Appliquer")
+        save_btn = QPushButton("Enregistrer")
+        btns.addWidget(preview_btn)
+        btns.addWidget(apply_btn)
+        btns.addWidget(save_btn)
+        right.addLayout(btns)
+        right.addStretch()
+        main.addLayout(right, 2)
+
+        s = load_settings()
+        self.html_edit.setPlainText(s.get("style_html", ""))
+        self.css_edit.setPlainText(s.get("style_css", ""))
+        self.js_edit.setPlainText(s.get("style_js", ""))
+        self.sidebar_cb.setChecked(s.get("style_include_sidebar", False))
+        self.current_qss = ""
+        if STYLE_FILE.exists():
+            self.current_qss = STYLE_FILE.read_text(encoding="utf-8")
+
+        self._has_box_shadow = "box-shadow" in self.css_edit.toPlainText()
+
+        preview_btn.clicked.connect(self.preview_qt)
+        apply_btn.clicked.connect(self.apply_clicked)
+        save_btn.clicked.connect(self.save_style)
+
+    def css_to_qss(self, css: str, include_sidebar: bool) -> str:
+        self._has_box_shadow = "box-shadow" in css
+        allowed = {
+            "background",
+            "background-color",
+            "color",
+            "border",
+            "border-radius",
+            "padding",
+            "font-size",
+            "font-weight",
+            "border-color",
+            "border-width",
+            "border-style",
+        }
+        base = {"": {}, "hover": {}, "pressed": {}, "disabled": {}}
+        variants: dict[str, dict[str, dict[str, str]]] = {}
+        pattern = re.compile(r"([^{]+){([^}]+)}")
+        for sel, body in pattern.findall(css):
+            props: dict[str, str] = {}
+            for line in body.split(';'):
+                line = line.strip()
+                if not line or ':' not in line:
+                    continue
+                k, v = line.split(':', 1)
+                k = k.strip()
+                v = v.strip()
+                if k not in allowed and not k.startswith('padding'):
+                    if k != "box-shadow":
+                        continue
+                props[k] = v
+            for sel_part in sel.split(','):
+                sel_part = sel_part.strip()
+                pseudo = ''
+                if ':' in sel_part:
+                    sel_base, pseudo = sel_part.split(':', 1)
+                    sel_part = sel_base.strip()
+                    pseudo = pseudo.strip()
+                variant = ''
+                target = base
+                if sel_part.startswith('.'):
+                    variant = sel_part[1:]
+                    target = variants.setdefault(
+                        variant, {"": {}, "hover": {}, "pressed": {}, "disabled": {}}
+                    )
+                elif sel_part.lower() not in {"", "button", "qpushbutton", ".btn"}:
+                    continue
+                state = ''
+                if pseudo == 'hover':
+                    state = 'hover'
+                elif pseudo in {'active', 'pressed'}:
+                    state = 'pressed'
+                elif pseudo == 'disabled':
+                    state = 'disabled'
+                target[state].update({k: v for k, v in props.items() if k != "box-shadow"})
+
+        def build(rule_dict: dict[str, dict[str, str]], selector: str) -> str:
+            res = ''
+            for state, props in rule_dict.items():
+                if not props:
+                    continue
+                sel = selector
+                if state == 'hover':
+                    sel += ':hover'
+                elif state == 'pressed':
+                    sel += ':pressed'
+                elif state == 'disabled':
+                    sel += ':disabled'
+                res += sel + " {\n"
+                for k, v in props.items():
+                    res += f"  {k}: {v};\n"
+                res += "}\n"
+            return res
+
+        qss = build(base, "QPushButton")
+        for var, data in variants.items():
+            qss += build(data, f'QPushButton[variant="{var}"]')
+
+        base_prefix = (
+            "QPushButton {\n"
+            "  border: 1px solid #444;\n"
+            "  border-radius: 8px;\n"
+            "  padding: 8px 14px;\n"
+            "}\n"
+            "QPushButton:hover {}\n"
+            "QPushButton:pressed {}\n"
+        )
+        qss = base_prefix + qss
+
+        if not include_sidebar:
+            qss += (
+                "QPushButton#sidebar-item {\n"
+                "  background: transparent;\n"
+                "  color: inherit;\n"
+                "  border: none;\n"
+                "  padding: 8px;\n"
+                "}\n"
+                "QPushButton#sidebar-item:hover {\n"
+                "  background: rgba(0,0,0,0.08);\n"
+                "}\n"
+                "QPushButton#sidebar-item:checked {\n"
+                "  background: rgba(0,0,0,0.12);\n"
+                "  font-weight: bold;\n"
+                "}\n"
+            )
+        return qss
+
+    def apply_qss_to_app(self, qss: str, include_sidebar: bool) -> None:
+        apply_qss(qss, include_sidebar, self._has_box_shadow)
+
+    def preview_qt(self) -> None:
+        qss = self.css_to_qss(self.css_edit.toPlainText(), self.sidebar_cb.isChecked())
+        for b in self.preview_buttons:
+            b.setStyleSheet(qss)
+        print_safe(f"[{ts()}] Aperçu Qt mis à jour")
+
+    def apply_clicked(self) -> None:
+        css = self.css_edit.toPlainText()
+        include = self.sidebar_cb.isChecked()
+        qss = self.css_to_qss(css, include)
+        if self.apply_cb.isChecked():
+            self.apply_qss_to_app(qss, include)
+        self.preview_qt()
+        self.current_qss = qss
+        print_safe(f"[{ts()}] Style appliqué")
+
+    def save_style(self) -> None:
+        include = self.sidebar_cb.isChecked()
+        css = self.css_edit.toPlainText()
+        qss = self.css_to_qss(css, include)
+        STYLE_FILE.write_text(qss, encoding="utf-8")
+        s = load_settings()
+        s["style_html"] = self.html_edit.toPlainText()
+        s["style_css"] = css
+        s["style_js"] = self.js_edit.toPlainText()
+        s["style_include_sidebar"] = include
+        save_settings(s)
+        print_safe(f"[{ts()}] Style sauvegardé")
+
+
+class SettingsPage(QWidget):
+    def __init__(self, theme_manager: ThemeManager) -> None:
+        super().__init__()
+        layout = QVBoxLayout(self)
+        tabs = QTabWidget()
+        layout.addWidget(tabs)
+        self.maintenance_tab = MaintenanceTab(theme_manager)
+        self.style_tab = StyleTab()
+        tabs.addTab(self.maintenance_tab, "Maintenance")
+        tabs.addTab(self.style_tab, "Style")
+
+
 class MainWindow(QMainWindow):
     def __init__(self, theme: ThemeManager) -> None:
         super().__init__()
         self.theme = theme
         s = load_settings()
         self.theme.apply(s.get("theme", "dark"))
+        if STYLE_FILE.exists():
+            try:
+                qss = STYLE_FILE.read_text(encoding="utf-8")
+                include_sidebar = s.get("style_include_sidebar", False)
+                has_shadow = "box-shadow" in s.get("style_css", "")
+                apply_qss(qss, include_sidebar, has_shadow)
+            except Exception as e:
+                print_safe(f"[{ts()}] Erreur application style.qss: {e}")
         self.setWindowTitle("COMPTA - Interface de gestion comptable")
         self.setMinimumSize(1200, 700)
 
@@ -504,6 +741,7 @@ class MainWindow(QMainWindow):
         ]
         for name, icon_name, handler in compta_items:
             btn = SidebarButton(name, get_icon(icon_name))
+            btn.setObjectName("sidebar-item")
             self.compta_buttons[name] = btn
             btn.clicked.connect(lambda _, b=btn, h=handler: h(b))
             self.compta_section.add_widget(btn)
@@ -512,16 +750,19 @@ class MainWindow(QMainWindow):
 
         self.scrap_section = CollapsibleSection("🛠️ Scraping")
         self.scrap_btn = SidebarButton("Scrap", get_icon("scrap"))
+        self.scrap_btn.setObjectName("sidebar-item")
         self.scrap_btn.clicked.connect(lambda _, b=self.scrap_btn: self.show_scrap_page(b))
         self.scrap_section.add_widget(self.scrap_btn)
         self.button_group.append(self.scrap_btn)
 
         self.profiles_btn = SidebarButton("Profil Scraping", get_icon("profil_scraping"))
+        self.profiles_btn.setObjectName("sidebar-item")
         self.profiles_btn.clicked.connect(lambda _, b=self.profiles_btn: self.show_profiles(b))
         self.scrap_section.add_widget(self.profiles_btn)
         self.button_group.append(self.profiles_btn)
 
         self.gallery_btn = SidebarButton("Galerie", get_icon("galerie"))
+        self.gallery_btn.setObjectName("sidebar-item")
         self.gallery_btn.clicked.connect(lambda _, b=self.gallery_btn: self.show_gallery_tab())
         self.scrap_section.add_widget(self.gallery_btn)
         self.button_group.append(self.gallery_btn)
@@ -537,6 +778,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(line)
 
         self.settings_btn = SidebarButton("Paramètres", get_icon("parametres"))
+        self.settings_btn.setObjectName("sidebar-item")
         self.settings_btn.clicked.connect(lambda _, b=self.settings_btn: self.show_settings(b))
         self.button_group.append(self.settings_btn)
         sidebar_layout.addWidget(self.settings_btn)

@@ -3,8 +3,8 @@ os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false;qt.qpa.*=false")
 
 from typing import Callable
 
-from PySide6.QtCore import QEasingCurve, Qt, QPropertyAnimation, Signal
-from PySide6.QtGui import QIcon, QKeySequence
+from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, Signal
+from PySide6.QtGui import QIcon, QKeySequence, QShortcut
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -18,7 +18,6 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QPushButton,
     QScrollArea,
-    QShortcut,
     QSizePolicy,
     QStackedWidget,
     QTabWidget,
@@ -443,14 +442,17 @@ class MainWindow(QMainWindow):
             other.collapse()
 
     def _install_shortcuts(self) -> None:
-        def add(key: str, fn: Callable[[], None]) -> None:
-            sc = QShortcut(QKeySequence(key), self)
-            sc.activated.connect(fn)
+        try:
+            def add(key: str, fn: Callable[[], None]) -> None:
+                sc = QShortcut(QKeySequence(key), self)
+                sc.activated.connect(fn)
 
-        add("Ctrl+1", lambda: self.show_scrap_page(self.scrap_btn))
-        add("Ctrl+2", lambda: self.show_profiles(self.profiles_btn))
-        add("Ctrl+3", self.show_gallery_tab)
-        add("Ctrl+5", lambda: self.show_settings(self.settings_btn))
+            add("Ctrl+1", lambda: self.show_scrap_page(self.scrap_btn))
+            add("Ctrl+2", lambda: self.show_profiles(self.profiles_btn))
+            add("Ctrl+3", self.show_gallery_tab)
+            add("Ctrl+5", lambda: self.show_settings(self.settings_btn))
+        except Exception as e:
+            print(f"Shortcuts disabled: {e}")
 
     def display_content(self, text: str, button: SidebarButton) -> None:
         self.clear_selection()

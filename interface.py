@@ -537,111 +537,166 @@ class StyleTab(QWidget):
         save_btn.clicked.connect(self.save_style)
 
     def css_to_qss(self, css: str, include_sidebar: bool) -> str:
+        """
+        Convertit un sous-ensemble de CSS en QSS ciblant QPushButton.
+        Règles :
+          - '.custom-btn', '.btn', '.button', 'button', 'qpushbutton' => base: QPushButton
+          - alias variantes : .primary/.secondary/.danger/.ghost, .btn-1..4
+          - :active => :pressed ; :disabled conservé ; :hover conservé
+          - propriétés supportées : background/background-color, color,
+            border/border-color/border-width/border-style, border-radius,
+            padding, font-size, font-weight
+          - autres propriétés : ignorées (ex: transition, transform, filter)
+        """
+        import re
+
         self._has_box_shadow = "box-shadow" in css
-        allowed = {
-            "background",
-            "background-color",
-            "color",
-            "border",
-            "border-radius",
-            "padding",
-            "font-size",
-            "font-weight",
-            "border-color",
-            "border-width",
-            "border-style",
-        }
+
+        # --- helpers ---
+        def parse_decls(block: str) -> dict[str, str]:
+            props: dict[str, str] = {}
+            for raw in block.split(";"):
+                if ":" not in raw:
+                    continue
+                k, v = raw.split(":", 1)
+                k = k.strip().lower()
+                v = v.strip()
+                if not k or not v:
+                    continue
+                # normalisation basique
+                if k in ("background", "background-color"):
+                    props["background"] = v
+                elif k == "color":
+                    props["color"] = v
+                elif k == "border":
+                    props["border"] = v
+                elif k == "border-color":
+                    props["border-color"] = v
+                elif k == "border-width":
+                    props["border-width"] = v
+                elif k == "border-style":
+                    props["border-style"] = v
+                elif k == "border-radius":
+                    props["border-radius"] = v
+                elif k == "padding":
+                    props["padding"] = v
+                elif k == "font-size":
+                    props["font-size"] = v
+                elif k == "font-weight":
+                    props["font-weight"] = v
+                elif k == "box-shadow":
+                    # Indice pour ajouter un QGraphicsDropShadowEffect ailleurs si besoin
+                    props["box-shadow"] = v
+                # sinon: ignoré
+            return props
+
+        def join_decls(d: dict[str, str]) -> str:
+            # ordre stable pour un QSS propre
+            order = [
+                "background", "color",
+                "border", "border-color", "border-width", "border-style",
+                "border-radius", "padding",
+                "font-size", "font-weight",
+            ]
+            seq = []
+            for k in order:
+                if k in d:
+                    seq.append(f"{k}:{d[k]};")
+            # on n'écrit pas box-shadow en QSS
+            return " ".join(seq)
+
+        # dictionnaires d'accumulation
         base = {"": {}, "hover": {}, "pressed": {}, "disabled": {}}
         variants: dict[str, dict[str, dict[str, str]]] = {}
-        pattern = re.compile(r"([^{]+){([^}]+)}")
-        for sel, body in pattern.findall(css):
-            props: dict[str, str] = {}
-            for line in body.split(';'):
-                line = line.strip()
-                if not line or ':' not in line:
-                    continue
-                k, v = line.split(':', 1)
-                k = k.strip()
-                v = v.strip()
-                if k not in allowed and not k.startswith('padding'):
-                    if k != "box-shadow":
-                        continue
-                props[k] = v
-            for sel_part in sel.split(','):
+
+        # alias de variantes usuelles
+        alias_variants = {
+            ".primary": "primary",
+            ".secondary": "secondary",
+            ".danger": "danger",
+            ".ghost": "ghost",
+            ".btn-1": "primary",
+            ".btn-2": "secondary",
+            ".btn-3": "danger",
+            ".btn-4": "ghost",
+        }
+
+        # découpe des règles CSS
+        for sel, decl in re.findall(r"([^{]+)\{([^}]*)\}", css, flags=re.S):
+            props = parse_decls(decl)
+            if not props:
+                continue
+
+            # sel peut contenir plusieurs parties séparées par ","
+            for sel_part in sel.split(","):
                 sel_part = sel_part.strip()
-                pseudo = ''
-                if ':' in sel_part:
-                    sel_base, pseudo = sel_part.split(':', 1)
-                    sel_part = sel_base.strip()
-                    pseudo = pseudo.strip()
-                variant = ''
-                target = base
-                if sel_part.startswith('.'):
-                    variant = sel_part[1:]
-                    target = variants.setdefault(
-                        variant, {"": {}, "hover": {}, "pressed": {}, "disabled": {}}
-                    )
-                elif sel_part.lower() not in {"", "button", "qpushbutton", ".btn"}:
+                if not sel_part:
                     continue
-                state = ''
-                if pseudo == 'hover':
-                    state = 'hover'
-                elif pseudo in {'active', 'pressed'}:
-                    state = 'pressed'
-                elif pseudo == 'disabled':
-                    state = 'disabled'
-                target[state].update({k: v for k, v in props.items() if k != "box-shadow"})
 
-        def build(rule_dict: dict[str, dict[str, str]], selector: str) -> str:
-            res = ''
-            for state, props in rule_dict.items():
-                if not props:
+                # extraire pseudo-état
+                pseudo = ""
+                if ":" in sel_part:
+                    _base, _pseudo = sel_part.split(":", 1)
+                    sel_part = _base.strip()
+                    pseudo = _pseudo.strip().lower()
+
+                # mapping pseudo-états
+                state = ""
+                if pseudo == "hover":
+                    state = "hover"
+                elif pseudo in ("active", "pressed"):
+                    state = "pressed"
+                elif pseudo == "disabled":
+                    state = "disabled"
+
+                # 1) cas "base" -> QPushButton
+                if sel_part.lower() in {"button", "qpushbutton"} or sel_part in {".custom-btn", ".btn", ".button"}:
+                    target = base
+                    target[state].update({k: v for k, v in props.items() if k != "box-shadow"})
                     continue
-                sel = selector
-                if state == 'hover':
-                    sel += ':hover'
-                elif state == 'pressed':
-                    sel += ':pressed'
-                elif state == 'disabled':
-                    sel += ':disabled'
-                res += sel + " {\n"
-                for k, v in props.items():
-                    res += f"  {k}: {v};\n"
-                res += "}\n"
-            return res
 
-        qss = build(base, "QPushButton")
-        for var, data in variants.items():
-            qss += build(data, f'QPushButton[variant="{var}"]')
+                # 2) alias de variantes connues
+                if sel_part in alias_variants:
+                    var = alias_variants[sel_part]
+                    target = variants.setdefault(var, {"": {}, "hover": {}, "pressed": {}, "disabled": {}})
+                    target[state].update({k: v for k, v in props.items() if k != "box-shadow"})
+                    continue
 
-        base_prefix = (
-            "QPushButton {\n"
-            "  border: 1px solid #444;\n"
-            "  border-radius: 8px;\n"
-            "  padding: 8px 14px;\n"
-            "}\n"
-            "QPushButton:hover {}\n"
-            "QPushButton:pressed {}\n"
-        )
-        qss = base_prefix + qss
+                # 3) classes inconnues => on les considère comme variantes (facultatif)
+                if sel_part.startswith("."):
+                    var = sel_part[1:]
+                    target = variants.setdefault(var, {"": {}, "hover": {}, "pressed": {}, "disabled": {}})
+                    target[state].update({k: v for k, v in props.items() if k != "box-shadow"})
+                    continue
 
+                # autres sélecteurs: ignorés
+
+        # construction du QSS
+        parts: list[str] = []
+
+        # base
+        for st_key, decls in base.items():
+            if decls:
+                pseudo = f":{st_key}" if st_key else ""
+                parts.append(f"QPushButton{pseudo}{{{join_decls(decls)}}}")
+
+        # variantes -> propriété dynamique [variant="..."]
+        for var, states in variants.items():
+            for st_key, decls in states.items():
+                if not decls:
+                    continue
+                pseudo = f":{st_key}" if st_key else ""
+                parts.append(f'QPushButton[variant="{var}"]{pseudo}' + "{" + join_decls(decls) + "}")
+
+        # exclusion sidebar si demandé
         if not include_sidebar:
-            qss += (
-                "QPushButton#sidebar-item {\n"
-                "  background: transparent;\n"
-                "  color: inherit;\n"
-                "  border: none;\n"
-                "  padding: 8px;\n"
-                "}\n"
-                "QPushButton#sidebar-item:hover {\n"
-                "  background: rgba(0,0,0,0.08);\n"
-                "}\n"
-                "QPushButton#sidebar-item:checked {\n"
-                "  background: rgba(0,0,0,0.12);\n"
-                "  font-weight: bold;\n"
-                "}\n"
+            parts.append(
+                "QPushButton#sidebar-item{background:transparent;color:inherit;border:none;padding:8px;}"
+                "QPushButton#sidebar-item:hover{background:rgba(0,0,0,0.08);}" \
+                "QPushButton#sidebar-item:checked{background:rgba(0,0,0,0.12);font-weight:bold;}"
             )
-        return qss
+
+        return "\n".join(parts)
 
     def apply_qss_to_app(self, qss: str, include_sidebar: bool) -> None:
         apply_qss(qss, include_sidebar, self._has_box_shadow)

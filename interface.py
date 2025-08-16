@@ -4,28 +4,45 @@ import json
 import re
 from pathlib import Path
 from datetime import datetime
+from uuid import uuid4
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false;qt.qpa.*=false")
 
 from typing import Callable
 
-from PySide6.QtCore import Qt, QPropertyAnimation, QEasingCurve, Signal, QProcess, Slot
+from PySide6.QtCore import (
+    Qt,
+    QPropertyAnimation,
+    QEasingCurve,
+    Signal,
+    QProcess,
+    Slot,
+    QTimer,
+    QObject,
+)
 from PySide6.QtGui import QIcon, QKeySequence, QShortcut, QColor, QFont
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
     QFrame,
+    QGroupBox,
     QHBoxLayout,
     QLabel,
     QLineEdit,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMessageBox,
     QPushButton,
     QScrollArea,
+    QSpinBox,
     QSizePolicy,
     QStackedWidget,
     QTabWidget,
+    QTableWidget,
+    QTableWidgetItem,
+    QTreeWidget,
+    QTreeWidgetItem,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -265,21 +282,641 @@ class SupplierTab(SimpleLabelPage):
         super().__init__("Fournisseurs (stub)")
 
 
-class ProfileWidget(QWidget):
+class ProfilesStore(QObject):
+    """In-memory store with JSON persistence."""
+
+    path = PROJECT_ROOT / "profiles.json"
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.profiles: list[dict] = self.load()
+
+    def load(self) -> list[dict]:
+        try:
+            return json.loads(self.path.read_text(encoding="utf-8"))
+        except Exception:
+            return []
+
+    def save(self, profiles: list[dict]) -> None:
+        try:
+            if self.path.exists():
+                bak = self.path.with_suffix(".json.bak")
+                bak.write_text(self.path.read_text(encoding="utf-8"), encoding="utf-8")
+            self.path.write_text(json.dumps(profiles, indent=2, ensure_ascii=False), encoding="utf-8")
+        except Exception as e:
+            print_safe(f"[profiles] save error: {e}")
+
+    def new_profile(self) -> dict:
+        now = datetime.utcnow().isoformat() + "Z"
+        return {
+            "id": str(uuid4()),
+            "name": "Sans titre",
+            "domains": [],
+            "tags": [],
+            "selectors": {
+                "listing": {"image": [], "item_link": []},
+                "detail": {"image": []},
+                "pagination": {"next": []},
+            },
+            "transforms": [],
+            "fetch": {
+                "user_agent": "",
+                "delay_ms": 0,
+                "max_depth": 0,
+                "max_items": 0,
+            },
+            "notes": "",
+            "created_at": now,
+            "updated_at": now,
+            "version": 1,
+        }
+
+    def duplicate(self, profile: dict) -> dict:
+        cp = json.loads(json.dumps(profile))
+        cp["id"] = str(uuid4())
+        cp["name"] = profile.get("name", "") + " (copie)"
+        now = datetime.utcnow().isoformat() + "Z"
+        cp["created_at"] = now
+        cp["updated_at"] = now
+        return cp
+
+    def find(self, pid: str) -> dict | None:
+        for p in self.profiles:
+            if p.get("id") == pid:
+                return p
+        return None
+
+    def remove(self, pid: str) -> None:
+        self.profiles = [p for p in self.profiles if p.get("id") != pid]
+
+
+class SelectorTester(QObject):
+    def split_selector(self, sel: str, key: str) -> tuple[str, str | None]:
+        css, attr = sel, None
+        if "@" in sel:
+            css, attr = sel.split("@", 1)
+        else:
+            if key == "image":
+                attr = "src"
+            elif key in {"item_link", "next"}:
+                attr = "href"
+        return css.strip(), attr
+
+    def apply_transforms(self, val: str, transforms: list[dict]) -> str:
+        for tr in transforms:
+            try:
+                val = re.sub(tr.get("match", ""), tr.get("replace", ""), val)
+            except re.error:
+                continue
+        return val
+
+    def evaluate_html(self, profile: dict, html: str) -> dict:
+        results: dict[str, list[dict]] = {}
+        selectors = profile.get("selectors", {})
+        transforms = profile.get("transforms", [])
+        try:
+            from lxml import html as lxml_html
+
+            tree = lxml_html.fromstring(html)
+            for zone, mapping in selectors.items():
+                for key, sels in mapping.items():
+                    out_key = f"{zone}.{key}"
+                    results[out_key] = []
+                    for sel in sels:
+                        css, attr = self.split_selector(sel, key)
+                        try:
+                            nodes = tree.cssselect(css)
+                        except Exception:
+                            nodes = []
+                        for n in nodes:
+                            if attr:
+                                val = (n.get(attr) or "").strip()
+                                if not val and key == "image" and attr == "src":
+                                    val = (n.get("data-src") or "").strip()
+                            else:
+                                val = (n.text_content() or "").strip()
+                            val = self.apply_transforms(val, transforms)
+                            results[out_key].append({"value": val, "context": lxml_html.tostring(n, encoding="unicode")})
+        except Exception:
+            from html.parser import HTMLParser
+
+            class Node:
+                def __init__(self, tag: str, attrs: dict[str, str]) -> None:
+                    self.tag = tag
+                    self.attrs = attrs
+                    self.children: list["Node"] = []
+
+            class Parser(HTMLParser):
+                def __init__(self) -> None:
+                    super().__init__()
+                    self.stack: list[Node] = []
+                    self.root = Node("root", {})
+                    self.stack.append(self.root)
+
+                def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+                    node = Node(tag, {k: v or "" for k, v in attrs})
+                    self.stack[-1].children.append(node)
+                    self.stack.append(node)
+
+                def handle_endtag(self, tag: str) -> None:
+                    if len(self.stack) > 1:
+                        self.stack.pop()
+
+            parser = Parser()
+            parser.feed(html)
+
+            def walk(node: Node) -> list[Node]:
+                arr = []
+                for c in node.children:
+                    arr.append(c)
+                    arr.extend(walk(c))
+                return arr
+
+            nodes = walk(parser.root)
+
+            def match(node: Node, css: str) -> bool:
+                tag = css
+                css_id = None
+                css_class = None
+                attr_name = None
+                attr_val = None
+                if "#" in tag:
+                    tag, css_id = tag.split("#", 1)
+                if "." in tag:
+                    tag, css_class = tag.split(".", 1)
+                m = re.search(r"\[(.+?)\]", tag)
+                if m:
+                    tag = tag.replace(m.group(0), "")
+                    part = m.group(1)
+                    if "=" in part:
+                        attr_name, attr_val = part.split("=", 1)
+                        attr_val = attr_val.strip('"\'')
+                    else:
+                        attr_name = part
+                tag = tag or None
+                if tag and node.tag != tag:
+                    return False
+                if css_id and node.attrs.get("id") != css_id:
+                    return False
+                if css_class and css_class not in node.attrs.get("class", "").split():
+                    return False
+                if attr_name:
+                    if attr_val is None and attr_name not in node.attrs:
+                        return False
+                    if attr_val is not None and node.attrs.get(attr_name) != attr_val:
+                        return False
+                return True
+
+            for zone, mapping in selectors.items():
+                for key, sels in mapping.items():
+                    out_key = f"{zone}.{key}"
+                    results[out_key] = []
+                    for sel in sels:
+                        css, attr = self.split_selector(sel, key)
+                        for n in nodes:
+                            if match(n, css):
+                                if attr:
+                                    val = n.attrs.get(attr, "")
+                                    if not val and key == "image" and attr == "src":
+                                        val = n.attrs.get("data-src", "")
+                                else:
+                                    val = ""
+                                val = self.apply_transforms(val, transforms)
+                                results[out_key].append({"value": val, "context": ""})
+        return results
+
+
+class ProfileEditor(QTabWidget):
+    changed = Signal()
+
+    def __init__(self, on_chosen: Callable[[str], None]) -> None:
+        super().__init__()
+        self.on_chosen = on_chosen
+        self.current: dict | None = None
+
+        self.general_tab = QWidget()
+        gen_layout = QVBoxLayout(self.general_tab)
+
+        name_layout = QHBoxLayout()
+        name_layout.addWidget(QLabel("Nom"))
+        self.name_edit = QLineEdit()
+        name_layout.addWidget(self.name_edit)
+        gen_layout.addLayout(name_layout)
+
+        dom_layout = QHBoxLayout()
+        self.domain_edit = QLineEdit()
+        add_dom_btn = QPushButton("+")
+        dom_layout.addWidget(self.domain_edit)
+        dom_layout.addWidget(add_dom_btn)
+        gen_layout.addLayout(dom_layout)
+        self.domains_list = QListWidget()
+        gen_layout.addWidget(self.domains_list)
+
+        fetch_box = QGroupBox("Fetch")
+        f_layout = QVBoxLayout(fetch_box)
+        ua_layout = QHBoxLayout()
+        ua_layout.addWidget(QLabel("User-Agent"))
+        self.ua_edit = QLineEdit()
+        ua_layout.addWidget(self.ua_edit)
+        f_layout.addLayout(ua_layout)
+
+        delay_layout = QHBoxLayout()
+        delay_layout.addWidget(QLabel("Delay (ms)"))
+        self.delay_spin = QSpinBox()
+        self.delay_spin.setMaximum(10000)
+        delay_layout.addWidget(self.delay_spin)
+        f_layout.addLayout(delay_layout)
+
+        depth_layout = QHBoxLayout()
+        depth_layout.addWidget(QLabel("Max depth"))
+        self.depth_spin = QSpinBox()
+        self.depth_spin.setMaximum(100)
+        depth_layout.addWidget(self.depth_spin)
+        f_layout.addLayout(depth_layout)
+
+        items_layout = QHBoxLayout()
+        items_layout.addWidget(QLabel("Max items"))
+        self.items_spin = QSpinBox()
+        self.items_spin.setMaximum(10000)
+        items_layout.addWidget(self.items_spin)
+        f_layout.addLayout(items_layout)
+
+        gen_layout.addWidget(fetch_box)
+        self.active_btn = QPushButton("Définir comme actif (UI)")
+        gen_layout.addWidget(self.active_btn)
+        gen_layout.addStretch()
+        self.addTab(self.general_tab, "Général")
+
+        add_dom_btn.clicked.connect(self.add_domain)
+        self.domains_list.itemDoubleClicked.connect(self.remove_domain)
+        self.name_edit.textChanged.connect(self.changed.emit)
+        self.domain_edit.textChanged.connect(self.changed.emit)
+        self.ua_edit.textChanged.connect(self.changed.emit)
+        self.delay_spin.valueChanged.connect(self.changed.emit)
+        self.depth_spin.valueChanged.connect(self.changed.emit)
+        self.items_spin.valueChanged.connect(self.changed.emit)
+        self.active_btn.clicked.connect(self._emit_active)
+
+        self.selectors_tab = QWidget()
+        sel_layout = QVBoxLayout(self.selectors_tab)
+        self.sel_table = QTableWidget(0, 5)
+        self.sel_table.setHorizontalHeaderLabels(["Zone", "Clé", "Sélecteur CSS", "Attr", "Sortie"])
+        self.sel_table.horizontalHeader().setStretchLastSection(True)
+        sel_layout.addWidget(self.sel_table)
+        btn_lay = QHBoxLayout()
+        self.sel_add_btn = QPushButton("Ajouter")
+        self.sel_dup_btn = QPushButton("Dupliquer")
+        self.sel_del_btn = QPushButton("Supprimer")
+        btn_lay.addWidget(self.sel_add_btn)
+        btn_lay.addWidget(self.sel_dup_btn)
+        btn_lay.addWidget(self.sel_del_btn)
+        btn_lay.addStretch()
+        sel_layout.addLayout(btn_lay)
+
+        sel_layout.addWidget(QLabel("Transforms"))
+        self.tr_table = QTableWidget(0, 2)
+        self.tr_table.setHorizontalHeaderLabels(["Regex", "Replace"])
+        sel_layout.addWidget(self.tr_table)
+        self.addTab(self.selectors_tab, "Sélecteurs")
+
+        self.sel_table.itemChanged.connect(self.changed.emit)
+        self.tr_table.itemChanged.connect(self.changed.emit)
+        self.sel_add_btn.clicked.connect(self.add_selector_row)
+        self.sel_dup_btn.clicked.connect(self.duplicate_selector_row)
+        self.sel_del_btn.clicked.connect(self.remove_selector_row)
+
+        self.test_tab = QWidget()
+        t_layout = QVBoxLayout(self.test_tab)
+        url_layout = QHBoxLayout()
+        url_layout.addWidget(QLabel("URL test"))
+        self.url_edit = QLineEdit()
+        url_layout.addWidget(self.url_edit)
+        t_layout.addLayout(url_layout)
+        self.html_edit = QPlainTextEdit()
+        self.html_edit.setPlaceholderText("Collez du HTML ici…")
+        t_layout.addWidget(self.html_edit)
+        self.eval_btn = QPushButton("Évaluer")
+        t_layout.addWidget(self.eval_btn)
+        self.summary_tree = QTreeWidget()
+        self.summary_tree.setHeaderLabels(["Sélecteur", "Matches"])
+        t_layout.addWidget(self.summary_tree)
+        self.result_table = QTableWidget(0, 2)
+        self.result_table.setHorizontalHeaderLabels(["Clé", "Valeur"])
+        self.result_table.horizontalHeader().setStretchLastSection(True)
+        t_layout.addWidget(self.result_table)
+        self.addTab(self.test_tab, "Test")
+        self.eval_btn.clicked.connect(self.evaluate_now)
+
+        self.notes_tab = QWidget()
+        notes_layout = QVBoxLayout(self.notes_tab)
+        self.notes_edit = QPlainTextEdit()
+        notes_layout.addWidget(self.notes_edit)
+        self.addTab(self.notes_tab, "Notes")
+        self.notes_edit.textChanged.connect(self.changed.emit)
+
+    def add_domain(self) -> None:
+        text = self.domain_edit.text().strip()
+        if text:
+            self.domains_list.addItem(text)
+            self.domain_edit.clear()
+            self.changed.emit()
+
+    def remove_domain(self, item: QListWidgetItem) -> None:
+        row = self.domains_list.row(item)
+        self.domains_list.takeItem(row)
+        self.changed.emit()
+
+    def _emit_active(self) -> None:
+        if self.current:
+            self.on_chosen(self.current.get("name", ""))
+
+    def add_selector_row(self) -> None:
+        row = self.sel_table.rowCount()
+        self.sel_table.insertRow(row)
+        for col, val in enumerate(["listing", "image", "", "", "url"]):
+            self.sel_table.setItem(row, col, QTableWidgetItem(val))
+        self.changed.emit()
+
+    def duplicate_selector_row(self) -> None:
+        row = self.sel_table.currentRow()
+        if row < 0:
+            return
+        vals = [self.sel_table.item(row, c).text() for c in range(5)]
+        self.sel_table.insertRow(row + 1)
+        for c, v in enumerate(vals):
+            self.sel_table.setItem(row + 1, c, QTableWidgetItem(v))
+        self.changed.emit()
+
+    def remove_selector_row(self) -> None:
+        rows = sorted({i.row() for i in self.sel_table.selectedIndexes()}, reverse=True)
+        for r in rows:
+            self.sel_table.removeRow(r)
+        if rows:
+            self.changed.emit()
+
+    def load_profile(self, profile: dict) -> None:
+        self.current = profile
+        self.name_edit.setText(profile.get("name", ""))
+        self.domains_list.clear()
+        for d in profile.get("domains", []):
+            self.domains_list.addItem(d)
+        self.ua_edit.setText(profile.get("fetch", {}).get("user_agent", ""))
+        self.delay_spin.setValue(profile.get("fetch", {}).get("delay_ms", 0))
+        self.depth_spin.setValue(profile.get("fetch", {}).get("max_depth", 0))
+        self.items_spin.setValue(profile.get("fetch", {}).get("max_items", 0))
+
+        self.sel_table.setRowCount(0)
+        selectors = profile.get("selectors", {})
+        for zone, mapping in selectors.items():
+            for key, sels in mapping.items():
+                for sel in sels:
+                    css, attr = sel.split("@", 1) if "@" in sel else (sel, "")
+                    row = self.sel_table.rowCount()
+                    self.sel_table.insertRow(row)
+                    self.sel_table.setItem(row, 0, QTableWidgetItem(zone))
+                    self.sel_table.setItem(row, 1, QTableWidgetItem(key))
+                    self.sel_table.setItem(row, 2, QTableWidgetItem(css))
+                    self.sel_table.setItem(row, 3, QTableWidgetItem(attr))
+                    self.sel_table.setItem(row, 4, QTableWidgetItem("url"))
+
+        self.tr_table.setRowCount(0)
+        for tr in profile.get("transforms", []):
+            r = self.tr_table.rowCount()
+            self.tr_table.insertRow(r)
+            self.tr_table.setItem(r, 0, QTableWidgetItem(tr.get("match", "")))
+            self.tr_table.setItem(r, 1, QTableWidgetItem(tr.get("replace", "")))
+
+        self.notes_edit.setPlainText(profile.get("notes", ""))
+
+    def read_profile(self) -> dict:
+        if not self.current:
+            return {}
+        p = self.current
+        p["name"] = self.name_edit.text().strip()
+        p["domains"] = [self.domains_list.item(i).text() for i in range(self.domains_list.count())]
+        p.setdefault("fetch", {})
+        p["fetch"].update({
+            "user_agent": self.ua_edit.text().strip(),
+            "delay_ms": self.delay_spin.value(),
+            "max_depth": self.depth_spin.value(),
+            "max_items": self.items_spin.value(),
+        })
+        selectors: dict[str, dict[str, list[str]]] = {}
+        for row in range(self.sel_table.rowCount()):
+            zone = self.sel_table.item(row, 0).text().strip()
+            key = self.sel_table.item(row, 1).text().strip()
+            css = self.sel_table.item(row, 2).text().strip()
+            attr = self.sel_table.item(row, 3).text().strip()
+            sel = f"{css}@{attr}" if attr else css
+            selectors.setdefault(zone, {}).setdefault(key, []).append(sel)
+        p["selectors"] = selectors
+
+        transforms: list[dict] = []
+        for row in range(self.tr_table.rowCount()):
+            reg = self.tr_table.item(row, 0)
+            rep = self.tr_table.item(row, 1)
+            if reg and rep:
+                transforms.append({"match": reg.text(), "replace": rep.text()})
+        p["transforms"] = transforms
+        p["notes"] = self.notes_edit.toPlainText()
+        p["updated_at"] = datetime.utcnow().isoformat() + "Z"
+        return p
+
+    def evaluate_now(self) -> None:
+        if not self.current:
+            return
+        profile = self.read_profile()
+        tester = SelectorTester()
+        html = self.html_edit.toPlainText()
+        res = tester.evaluate_html(profile, html)
+        self.render_summary(res)
+
+    def render_summary(self, data: dict[str, list[dict]]) -> None:
+        self.summary_tree.clear()
+        self.result_table.setRowCount(0)
+        for key, values in data.items():
+            top = QTreeWidgetItem([key, str(len(values))])
+            self.summary_tree.addTopLevelItem(top)
+            for v in values[:3]:
+                QTreeWidgetItem(top, [v.get("value", "")])
+            for v in values:
+                r = self.result_table.rowCount()
+                self.result_table.insertRow(r)
+                self.result_table.setItem(r, 0, QTableWidgetItem(key))
+                self.result_table.setItem(r, 1, QTableWidgetItem(v.get("value", "")))
+
+
+class ProfileScrapingWidget(QWidget):
     profile_chosen = Signal(str)
     profiles_updated = Signal()
 
     def __init__(self) -> None:
         super().__init__()
-        layout = QVBoxLayout(self)
-        layout.addWidget(QLabel("Profil Scraping (stub)", alignment=Qt.AlignCenter))
-        choose = QPushButton("Choisir profil")
-        refresh = QPushButton("Rafraîchir profils")
-        layout.addWidget(choose)
-        layout.addWidget(refresh)
-        layout.addStretch()
-        choose.clicked.connect(lambda: self.profile_chosen.emit("bob crew"))
-        refresh.clicked.connect(self.profiles_updated.emit)
+        self.store = ProfilesStore()
+        self.current_id: str | None = None
+
+        main_layout = QHBoxLayout(self)
+
+        left = QVBoxLayout()
+        self.search_edit = QLineEdit()
+        self.search_edit.setPlaceholderText("Recherche…")
+        left.addWidget(self.search_edit)
+        self.list_widget = QListWidget()
+        left.addWidget(self.list_widget, 1)
+        btn_lay = QHBoxLayout()
+        self.new_btn = QPushButton("+ Nouveau")
+        self.dup_btn = QPushButton("Dupliquer")
+        self.exp_btn = QPushButton("Exporter")
+        self.imp_btn = QPushButton("Importer")
+        self.del_btn = QPushButton("Supprimer")
+        for b in [self.new_btn, self.dup_btn, self.exp_btn, self.imp_btn, self.del_btn]:
+            btn_lay.addWidget(b)
+        left.addLayout(btn_lay)
+        main_layout.addLayout(left, 1)
+
+        self.editor = ProfileEditor(lambda name: self.profile_chosen.emit(name))
+        main_layout.addWidget(self.editor, 3)
+
+        bottom = QVBoxLayout()
+        self.status_label = QLabel("Profil: - | Sauvegardé: -")
+        bottom.addWidget(self.status_label)
+        main_layout.addLayout(bottom)
+
+        for p in self.store.profiles:
+            self._add_list_item(p)
+
+        self.list_widget.currentItemChanged.connect(self._on_select)
+        self.search_edit.textChanged.connect(self._filter_list)
+
+        self.new_btn.clicked.connect(self._create_new)
+        self.dup_btn.clicked.connect(self._duplicate)
+        self.del_btn.clicked.connect(self._delete)
+        self.exp_btn.clicked.connect(self._export)
+        self.imp_btn.clicked.connect(self._import)
+
+        self.editor.changed.connect(self._schedule_save)
+        self.save_timer = QTimer(self)
+        self.save_timer.setSingleShot(True)
+        self.save_timer.setInterval(500)
+        self.save_timer.timeout.connect(self._autosave)
+
+        if self.list_widget.count() > 0:
+            self.list_widget.setCurrentRow(0)
+
+    def _add_list_item(self, profile: dict) -> None:
+        item = QListWidgetItem(profile.get("name", ""))
+        item.setData(Qt.UserRole, profile.get("id"))
+        item.setToolTip(", ".join(profile.get("domains", [])))
+        imgs = profile.get("selectors", {}).get("listing", {}).get("image", [])
+        if imgs:
+            item.setForeground(QColor("green"))
+        else:
+            item.setForeground(QColor("orange"))
+        self.list_widget.addItem(item)
+
+    def _filter_list(self, text: str) -> None:
+        t = text.lower()
+        for i in range(self.list_widget.count()):
+            it = self.list_widget.item(i)
+            name = it.text().lower()
+            dom = it.toolTip().lower()
+            it.setHidden(t not in name and t not in dom)
+
+    def _on_select(self, item: QListWidgetItem) -> None:
+        if not item:
+            return
+        pid = item.data(Qt.UserRole)
+        self.current_id = pid
+        prof = self.store.find(pid)
+        if prof:
+            self.editor.load_profile(prof)
+            self.status_label.setText(f"Profil: {prof.get('name')} | Sauvegardé: {prof.get('updated_at')}")
+
+    def _create_new(self) -> None:
+        p = self.store.new_profile()
+        self.store.profiles.append(p)
+        self._add_list_item(p)
+        self.list_widget.setCurrentRow(self.list_widget.count() - 1)
+        self._autosave()
+        print_safe("Profil créé")
+
+    def _duplicate(self) -> None:
+        item = self.list_widget.currentItem()
+        if not item:
+            return
+        prof = self.store.find(item.data(Qt.UserRole))
+        if not prof:
+            return
+        p = self.store.duplicate(prof)
+        self.store.profiles.append(p)
+        self._add_list_item(p)
+        self.list_widget.setCurrentRow(self.list_widget.count() - 1)
+        self._autosave()
+        print_safe("Profil dupliqué")
+
+    def _delete(self) -> None:
+        item = self.list_widget.currentItem()
+        if not item:
+            return
+        if QMessageBox.question(self, "Confirmer", "Supprimer ce profil ?") != QMessageBox.Yes:
+            return
+        pid = item.data(Qt.UserRole)
+        self.store.remove(pid)
+        row = self.list_widget.row(item)
+        self.list_widget.takeItem(row)
+        self._autosave()
+        self.profiles_updated.emit()
+        print_safe("Profil supprimé")
+
+    def _export(self) -> None:
+        item = self.list_widget.currentItem()
+        if not item:
+            return
+        prof = self.store.find(item.data(Qt.UserRole))
+        if not prof:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Exporter profil", "profile.json", "JSON (*.json)")
+        if path:
+            try:
+                Path(path).write_text(json.dumps(prof, indent=2, ensure_ascii=False), encoding="utf-8")
+                print_safe("Profil exporté")
+            except Exception as e:
+                print_safe(f"Export erreur: {e}")
+
+    def _import(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "Importer profil", "", "JSON (*.json)")
+        if not path:
+            return
+        try:
+            prof = json.loads(Path(path).read_text(encoding="utf-8"))
+        except Exception as e:
+            print_safe(f"Import erreur: {e}")
+            return
+        if not isinstance(prof, dict) or "id" not in prof or "name" not in prof or "selectors" not in prof:
+            print_safe("Profil invalide")
+            return
+        if self.store.find(prof["id"]):
+            prof["id"] = str(uuid4())
+        self.store.profiles.append(prof)
+        self._add_list_item(prof)
+        self.list_widget.setCurrentRow(self.list_widget.count() - 1)
+        self._autosave()
+        print_safe("Profil importé")
+
+    def _schedule_save(self) -> None:
+        self.save_timer.start()
+
+    def _autosave(self) -> None:
+        if not self.current_id:
+            return
+        prof = self.store.find(self.current_id)
+        if not prof:
+            return
+        self.editor.read_profile()
+        self.store.save(self.store.profiles)
+        self.status_label.setText(f"Profil: {prof.get('name')} | Sauvegardé: {prof.get('updated_at')}")
+        self.profiles_updated.emit()
+        print_safe("Profil sauvegardé")
 
 
 class GalleryWidget(SimpleLabelPage):
@@ -843,7 +1480,7 @@ class MainWindow(QMainWindow):
         main_layout.addWidget(sidebar_container, 1)
         main_layout.addWidget(self.stack, 4)
 
-        self.profile_page = ProfileWidget()
+        self.profile_page = ProfileScrapingWidget()
         self.scrap_page = ScrapWidget()
         self.gallery_page = GalleryWidget()
         self.dashboard_page = DashboardWidget()

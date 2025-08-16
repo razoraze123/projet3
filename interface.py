@@ -57,6 +57,10 @@ GLOBAL_CONSOLE: QTextEdit | None = None
 PROJECT_ROOT = Path(__file__).resolve().parent
 SETTINGS_FILE = PROJECT_ROOT / "settings.json"
 STYLE_FILE = PROJECT_ROOT / "style.qss"
+try:
+    PROFILES_PATH = ProfilesStore.path  # si la classe existe déjà
+except Exception:
+    PROFILES_PATH = Path(__file__).resolve().parent / "profiles.json"
 
 def load_settings() -> dict:
     try:
@@ -941,7 +945,6 @@ class ImagesWidget(QWidget):
         profile_layout = QHBoxLayout()
         profile_layout.addWidget(QLabel("Profil :"))
         self.profile_combo = QComboBox()
-        self.profile_combo.addItem("bob crew")
         profile_layout.addWidget(self.profile_combo)
         layout.addLayout(profile_layout)
 
@@ -977,6 +980,7 @@ class ImagesWidget(QWidget):
         self.launch_btn.clicked.connect(self.run_example)
         copy_btn.clicked.connect(lambda: print_safe("Copier simulé"))
         export_btn.clicked.connect(lambda: print_safe("Exporter simulé"))
+        self.profile_combo.currentTextChanged.connect(self._save_last_profile)
 
     def browse_file(self) -> None:
         QFileDialog.getOpenFileName(self, "Choisir fichier")
@@ -993,13 +997,44 @@ class ImagesWidget(QWidget):
         self.progress_label.setText("Progression 2/2")
         print_safe("Scrap simulé : 2 éléments")
 
+    def _save_last_profile(self, name: str) -> None:
+        try:
+            s = load_settings()
+            s["last_profile_name"] = name
+            save_settings(s)
+        except Exception:
+            pass
+
     def set_selected_profile(self, name: str) -> None:
+        if not name:
+            return
         idx = self.profile_combo.findText(name)
-        if idx >= 0:
-            self.profile_combo.setCurrentIndex(idx)
+        if idx < 0:
+            # si le profil vient d’être créé et n’est pas encore dans la liste
+            self.profile_combo.addItem(name)
+            idx = self.profile_combo.count() - 1
+        self.profile_combo.setCurrentIndex(idx)
 
     def refresh_profiles(self) -> None:
-        print_safe("Rafraîchissement des profils")
+        """Recharge la liste des profils depuis profiles.json."""
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        names: list[str] = []
+        try:
+            path = PROFILES_PATH
+            if path.exists():
+                data = json.loads(path.read_text(encoding="utf-8"))
+                # récupère les noms valides
+                names = [str(p.get("name", "")).strip() for p in data if p.get("name")]
+        except Exception as e:
+            print_safe(f"[profiles] Chargement impossible: {e}")
+        # dédoublonne + trie
+        names = sorted(dict.fromkeys([n for n in names if n]))
+        if names:
+            self.profile_combo.addItems(names)
+        else:
+            self.profile_combo.addItem("(aucun profil)")
+        self.profile_combo.blockSignals(False)
 
 
 class ScrapWidget(QWidget):
@@ -1503,6 +1538,10 @@ class MainWindow(QMainWindow):
 
         self.profile_page.profile_chosen.connect(self.scrap_page.images_widget.set_selected_profile)
         self.profile_page.profiles_updated.connect(self.scrap_page.images_widget.refresh_profiles)
+        self.scrap_page.images_widget.refresh_profiles()
+        last = load_settings().get("last_profile_name", "")
+        if last:
+            self.scrap_page.images_widget.set_selected_profile(last)
 
         self._install_shortcuts()
 

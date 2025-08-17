@@ -928,113 +928,72 @@ class GalleryWidget(SimpleLabelPage):
         super().__init__("Galerie (stub)")
 
 
-class ImagesWidget(QWidget):
+class BetaWidget(QWidget):
     def __init__(self) -> None:
         super().__init__()
         layout = QVBoxLayout(self)
 
-        file_layout = QHBoxLayout()
-        file_layout.addWidget(QLabel("Fichier :"))
-        self.file_edit = QLineEdit()
-        file_layout.addWidget(self.file_edit)
-        browse_file = QPushButton("Parcourir…")
-        browse_file.clicked.connect(self.browse_file)
-        file_layout.addWidget(browse_file)
-        layout.addLayout(file_layout)
-
-        profile_layout = QHBoxLayout()
-        profile_layout.addWidget(QLabel("Profil :"))
-        self.profile_combo = QComboBox()
-        profile_layout.addWidget(self.profile_combo)
-        layout.addLayout(profile_layout)
-
-        folder_layout = QHBoxLayout()
-        folder_layout.addWidget(QLabel("Dossier :"))
-        self.folder_edit = QLineEdit()
-        folder_layout.addWidget(self.folder_edit)
-        browse_folder = QPushButton("Parcourir…")
-        browse_folder.clicked.connect(self.browse_folder)
-        folder_layout.addWidget(browse_folder)
-        layout.addLayout(folder_layout)
-
-        self.variants_cb = QCheckBox("Scraper aussi les variantes")
-        self.isolate_cb = QCheckBox("Isoler (QProcess)")
-        layout.addWidget(self.variants_cb)
-        layout.addWidget(self.isolate_cb)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
+        url_layout = QHBoxLayout()
+        url_layout.addWidget(QLabel("URL :"))
+        self.url_edit = QLineEdit()
+        url_layout.addWidget(self.url_edit)
         self.launch_btn = QPushButton("Lancer")
-        copy_btn = QPushButton("Copier")
-        export_btn = QPushButton("Exporter")
-        btn_layout.addWidget(self.launch_btn)
-        btn_layout.addWidget(copy_btn)
-        btn_layout.addWidget(export_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
+        url_layout.addWidget(self.launch_btn)
+        layout.addLayout(url_layout)
 
-        self.list_widget = QListWidget()
-        layout.addWidget(self.list_widget)
-        self.progress_label = QLabel("Progression 0/0")
+        self.console = QPlainTextEdit()
+        self.console.setReadOnly(True)
+        layout.addWidget(self.console)
+
+        self.progress_label = QLabel("Prêt")
         layout.addWidget(self.progress_label)
-        self.launch_btn.clicked.connect(self.run_example)
-        copy_btn.clicked.connect(lambda: print_safe("Copier simulé"))
-        export_btn.clicked.connect(lambda: print_safe("Exporter simulé"))
-        self.profile_combo.currentTextChanged.connect(self._save_last_profile)
 
-    def browse_file(self) -> None:
-        QFileDialog.getOpenFileName(self, "Choisir fichier")
+        self.process = QProcess(self)
+        self.process.setProcessChannelMode(QProcess.ProcessChannelMode.MergedChannels)
+        self.launch_btn.clicked.connect(self.start_process)
+        self.process.readyReadStandardOutput.connect(self._append_output)
+        self.process.finished.connect(self._on_finished)
 
-    def browse_folder(self) -> None:
-        QFileDialog.getExistingDirectory(self, "Choisir dossier")
-
-    def run_example(self) -> None:
-        self.list_widget.clear()
-        for i in range(2):
-            item = QListWidgetItem(f"Image {i+1}")
-            item.setCheckState(Qt.Checked)
-            self.list_widget.addItem(item)
-        self.progress_label.setText("Progression 2/2")
-        print_safe("Scrap simulé : 2 éléments")
-
-    def _save_last_profile(self, name: str) -> None:
-        try:
-            s = load_settings()
-            s["last_profile_name"] = name
-            save_settings(s)
-        except Exception:
-            pass
-
-    def set_selected_profile(self, name: str) -> None:
-        if not name:
+    def start_process(self) -> None:
+        url = self.url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "URL manquante", "Veuillez saisir une URL.")
             return
-        idx = self.profile_combo.findText(name)
-        if idx < 0:
-            # si le profil vient d’être créé et n’est pas encore dans la liste
-            self.profile_combo.addItem(name)
-            idx = self.profile_combo.count() - 1
-        self.profile_combo.setCurrentIndex(idx)
+        self.launch_btn.setEnabled(False)
+        self.console.clear()
+        self.progress_label.setText("Démarrage…")
+        args = [
+            "-m",
+            "scraper.images_csv",
+            "--url",
+            url,
+            "--css",
+            ".product-gallery__media-list img",
+            "--images-mode",
+            "wp-prefix",
+            "--wp-prefix-url",
+            "https://www.planetebob.fr/wp-content/uploads",
+        ]
+        self.process.start(sys.executable, args)
 
-    def refresh_profiles(self) -> None:
-        """Recharge la liste des profils depuis profiles.json."""
-        self.profile_combo.blockSignals(True)
-        self.profile_combo.clear()
-        names: list[str] = []
-        try:
-            path = PROFILES_PATH
-            if path.exists():
-                data = json.loads(path.read_text(encoding="utf-8"))
-                # récupère les noms valides
-                names = [str(p.get("name", "")).strip() for p in data if p.get("name")]
-        except Exception as e:
-            print_safe(f"[profiles] Chargement impossible: {e}")
-        # dédoublonne + trie
-        names = sorted(dict.fromkeys([n for n in names if n]))
-        if names:
-            self.profile_combo.addItems(names)
-        else:
-            self.profile_combo.addItem("(aucun profil)")
-        self.profile_combo.blockSignals(False)
+    def _append_output(self) -> None:
+        data = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if not data:
+            return
+        self.console.appendPlainText(data.rstrip())
+        for line in data.splitlines():
+            line = line.strip()
+            if "image(s) détectée(s)" in line:
+                self.progress_label.setText(line)
+            elif line.startswith("CSV upsert"):
+                self.progress_label.setText("CSV upsert…")
+            elif "✅ Terminé" in line or "Terminé" in line:
+                self.progress_label.setText("✅ Terminé")
+
+    def _on_finished(self) -> None:
+        self.launch_btn.setEnabled(True)
+        if not self.progress_label.text().startswith("✅"):
+            self.progress_label.setText("Terminé")
 
 
 class ScrapWidget(QWidget):
@@ -1043,8 +1002,8 @@ class ScrapWidget(QWidget):
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
-        self.images_widget = ImagesWidget()
-        self.tabs.addTab(self.images_widget, "Images")
+        self.beta_widget = BetaWidget()
+        self.tabs.addTab(self.beta_widget, "Beta")
         for name in [
             "Collections",
             "Serveur Flask",
@@ -1536,12 +1495,6 @@ class MainWindow(QMainWindow):
         ]:
             self.stack.addWidget(w)
 
-        self.profile_page.profile_chosen.connect(self.scrap_page.images_widget.set_selected_profile)
-        self.profile_page.profiles_updated.connect(self.scrap_page.images_widget.refresh_profiles)
-        self.scrap_page.images_widget.refresh_profiles()
-        last = load_settings().get("last_profile_name", "")
-        if last:
-            self.scrap_page.images_widget.set_selected_profile(last)
 
         self._install_shortcuts()
 

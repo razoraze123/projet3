@@ -6,7 +6,7 @@ from pathlib import Path
 from datetime import datetime
 os.environ.setdefault("QT_LOGGING_RULES", "qt.qpa.fonts=false;qt.qpa.*=false")
 
-from typing import Callable
+from typing import Callable, List
 
 from PySide6.QtCore import (
     Qt,
@@ -35,6 +35,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QStackedWidget,
     QTabWidget,
+    QPlainTextEdit,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -479,7 +480,7 @@ class StyleTab(QWidget):
         main.addWidget(self.editors, 3)
 
         right = QVBoxLayout()
-        self.preview_buttons: list[QPushButton] = []
+        self.preview_buttons: List[QPushButton] = []
         for text, var in [
             ("Primary", "primary"),
             ("Secondary", "secondary"),

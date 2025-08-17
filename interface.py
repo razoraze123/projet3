@@ -278,77 +278,81 @@ class GalleryWidget(SimpleLabelPage):
         super().__init__("Galerie (stub)")
 
 
-class ImagesWidget(QWidget):
+
+
+
+class BetaWidget(QWidget):
     def __init__(self) -> None:
         super().__init__()
         layout = QVBoxLayout(self)
 
-        file_layout = QHBoxLayout()
-        file_layout.addWidget(QLabel("Fichier :"))
-        self.file_edit = QLineEdit()
-        file_layout.addWidget(self.file_edit)
-        browse_file = QPushButton("Parcourir…")
-        browse_file.clicked.connect(self.browse_file)
-        file_layout.addWidget(browse_file)
-        layout.addLayout(file_layout)
-
-        profile_layout = QHBoxLayout()
-        profile_layout.addWidget(QLabel("Profil (désactivé) :"))
-        self.profile_combo = QComboBox()
-        self.profile_combo.addItem("Sans titre")
-        self.profile_combo.setEnabled(False)
-        profile_layout.addWidget(self.profile_combo)
-        layout.addLayout(profile_layout)
-
-        folder_layout = QHBoxLayout()
-        folder_layout.addWidget(QLabel("Dossier :"))
-        self.folder_edit = QLineEdit()
-        folder_layout.addWidget(self.folder_edit)
-        browse_folder = QPushButton("Parcourir…")
-        browse_folder.clicked.connect(self.browse_folder)
-        folder_layout.addWidget(browse_folder)
-        layout.addLayout(folder_layout)
-
-        self.variants_cb = QCheckBox("Scraper aussi les variantes")
-        self.isolate_cb = QCheckBox("Isoler (QProcess)")
-        layout.addWidget(self.variants_cb)
-        layout.addWidget(self.isolate_cb)
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
+        url_layout = QHBoxLayout()
+        url_layout.addWidget(QLabel("URL:"))
+        self.url_edit = QLineEdit()
+        url_layout.addWidget(self.url_edit)
         self.launch_btn = QPushButton("Lancer")
-        copy_btn = QPushButton("Copier")
-        export_btn = QPushButton("Exporter")
-        btn_layout.addWidget(self.launch_btn)
-        btn_layout.addWidget(copy_btn)
-        btn_layout.addWidget(export_btn)
-        btn_layout.addStretch()
-        layout.addLayout(btn_layout)
+        url_layout.addWidget(self.launch_btn)
+        layout.addLayout(url_layout)
 
-        self.list_widget = QListWidget()
-        layout.addWidget(self.list_widget)
-        self.progress_label = QLabel("Progression 0/0")
+        self.console = QTextEdit()
+        self.console.setReadOnly(True)
+        layout.addWidget(self.console)
+
+        self.progress_label = QLabel("En attente…")
         layout.addWidget(self.progress_label)
-        self.launch_btn.clicked.connect(self.run_example)
-        copy_btn.clicked.connect(lambda: print_safe("Copier simulé"))
-        export_btn.clicked.connect(lambda: print_safe("Exporter simulé"))
 
-    def browse_file(self) -> None:
-        QFileDialog.getOpenFileName(self, "Choisir fichier")
+        self.process: QProcess | None = None
+        self.launch_btn.clicked.connect(self.start_process)
 
-    def browse_folder(self) -> None:
-        QFileDialog.getExistingDirectory(self, "Choisir dossier")
+    @Slot()
+    def start_process(self) -> None:
+        url = self.url_edit.text().strip()
+        if not url:
+            QMessageBox.warning(self, "Beta", "Veuillez entrer une URL.")
+            return
+        self.console.clear()
+        self.progress_label.setText("Démarrage…")
+        self.launch_btn.setEnabled(False)
 
-    def run_example(self) -> None:
-        self.list_widget.clear()
-        for i in range(2):
-            item = QListWidgetItem(f"Image {i+1}")
-            item.setCheckState(Qt.Checked)
-            self.list_widget.addItem(item)
-        self.progress_label.setText("Progression 2/2")
-        print_safe("Scrap simulé : 2 éléments")
+        self.process = QProcess(self)
+        self.process.setProgram(sys.executable)
+        args = [
+            "-m",
+            "scraper.images_csv",
+            "--url",
+            url,
+            "--css",
+            ".product-gallery__media-list img",
+            "--images-mode",
+            "wp-prefix",
+            "--wp-prefix-url",
+            "https://www.planetebob.fr/wp-content/uploads",
+        ]
+        self.process.setArguments(args)
+        self.process.setProcessChannelMode(QProcess.MergedChannels)
+        self.process.readyReadStandardOutput.connect(self._handle_output)
+        self.process.finished.connect(self._process_finished)
+        self.process.start()
 
+    @Slot()
+    def _handle_output(self) -> None:
+        if not self.process:
+            return
+        data = bytes(self.process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        if not data:
+            return
+        for line in data.splitlines():
+            self.console.append(line)
+            lower = line.lower()
+            if "image(s) détectée" in lower or "csv upsert" in lower or "terminé" in lower:
+                self.progress_label.setText(line)
 
+    @Slot(int, QProcess.ExitStatus)
+    def _process_finished(self, code: int, status: QProcess.ExitStatus) -> None:
+        msg = "✅ Terminé" if code == 0 else f"❌ Erreur (code {code})"
+        self.console.append(msg)
+        self.progress_label.setText(msg)
+        self.launch_btn.setEnabled(True)
 
 class ScrapWidget(QWidget):
     def __init__(self) -> None:
@@ -356,8 +360,6 @@ class ScrapWidget(QWidget):
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
         layout.addWidget(self.tabs)
-        self.images_widget = ImagesWidget()
-        self.tabs.addTab(self.images_widget, "Images")
         for name in [
             "Collections",
             "Serveur Flask",
@@ -800,6 +802,13 @@ class MainWindow(QMainWindow):
         self.gallery_btn.clicked.connect(lambda _, b=self.gallery_btn: self.show_gallery_tab())
         self.scrap_section.add_widget(self.gallery_btn)
         self.button_group.append(self.gallery_btn)
+
+        self.beta_btn = SidebarButton("Beta", get_icon("scrap"))
+        self.beta_btn.setObjectName("sidebar-item")
+        self.beta_btn.clicked.connect(lambda _, b=self.beta_btn: self.show_beta_page(b))
+        self.scrap_section.add_widget(self.beta_btn)
+        self.button_group.append(self.beta_btn)
+
         nav_layout.addWidget(self.scrap_section)
 
         self.compta_section.toggle_button.clicked.connect(lambda: self._collapse_other(self.compta_section))
@@ -824,6 +833,7 @@ class MainWindow(QMainWindow):
 
         self.scrap_page = ScrapWidget()
         self.gallery_page = GalleryWidget()
+        self.beta_page = BetaWidget()
         self.dashboard_page = DashboardWidget()
         self.accounts_page = AccountWidget()
         self.revision_page = RevisionTab()
@@ -833,6 +843,7 @@ class MainWindow(QMainWindow):
         for w in [
             self.scrap_page,
             self.gallery_page,
+            self.beta_page,
             self.dashboard_page,
             self.accounts_page,
             self.revision_page,
@@ -881,6 +892,11 @@ class MainWindow(QMainWindow):
         self.clear_selection()
         self.gallery_btn.setChecked(True)
         self.stack.setCurrentWidget(self.gallery_page)
+
+    def show_beta_page(self, button: SidebarButton) -> None:
+        self.clear_selection()
+        button.setChecked(True)
+        self.stack.setCurrentWidget(self.beta_page)
 
     def show_dashboard_page(self, button: SidebarButton) -> None:
         self.clear_selection()
